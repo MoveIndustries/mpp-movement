@@ -256,6 +256,10 @@ pub enum MppError {
     #[error("{}", format_delta_too_small(.0))]
     DeltaTooSmall(Option<String>),
 
+    /// Voucher cumulative amount is below the highest already accepted (stale voucher).
+    #[error("{}", format_amount_not_increasing(.0))]
+    AmountNotIncreasing(Option<String>),
+
     /// Payment channel not found.
     #[error("{}", format_channel_not_found(.0))]
     ChannelNotFound(Option<String>),
@@ -371,6 +375,14 @@ fn format_delta_too_small(reason: &Option<String>) -> String {
     match reason {
         Some(r) => format!("Delta too small: {}.", r),
         None => "Amount increase below minimum voucher delta.".to_string(),
+    }
+}
+
+fn format_amount_not_increasing(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Voucher amount not increasing: {}.", r),
+        None => "Voucher cumulative amount must exceed the highest amount already accepted."
+            .to_string(),
     }
 }
 
@@ -525,6 +537,7 @@ impl MppError {
             Self::SignerMismatch(_) => Some("session/signer-mismatch"),
             Self::AmountExceedsDeposit(_) => Some("session/amount-exceeds-deposit"),
             Self::DeltaTooSmall(_) => Some("session/delta-too-small"),
+            Self::AmountNotIncreasing(_) => Some("session/amount-not-increasing"),
             Self::ChannelNotFound(_) => Some("session/channel-not-found"),
             Self::ChannelClosed(_) => Some("session/channel-finalized"),
             _ => None,
@@ -577,6 +590,9 @@ impl PaymentError for MppError {
                 .with_status(402),
             Self::DeltaTooSmall(_) => PaymentErrorDetails::session("delta-too-small")
                 .with_title("DeltaTooSmallError")
+                .with_status(402),
+            Self::AmountNotIncreasing(_) => PaymentErrorDetails::session("amount-not-increasing")
+                .with_title("AmountNotIncreasingError")
                 .with_status(402),
             Self::ChannelNotFound(_) => PaymentErrorDetails::session("channel-not-found")
                 .with_title("ChannelNotFoundError")
@@ -952,6 +968,28 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Amount increase below minimum voucher delta."
+        );
+    }
+
+    #[test]
+    fn test_amount_not_increasing_problem_details() {
+        let err = MppError::AmountNotIncreasing(Some("stale voucher".to_string()));
+        assert_eq!(
+            err.to_string(),
+            "Voucher amount not increasing: stale voucher."
+        );
+        let problem = err.to_problem_details(None);
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/session/amount-not-increasing"
+        );
+        assert_eq!(problem.title, "AmountNotIncreasingError");
+        assert_eq!(problem.status, 402);
+
+        let err = MppError::AmountNotIncreasing(None);
+        assert_eq!(
+            err.to_string(),
+            "Voucher cumulative amount must exceed the highest amount already accepted."
         );
     }
 

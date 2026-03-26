@@ -9,8 +9,9 @@
 //! ```bash
 //! cargo test --features movement,server,client --test integration_movement
 //! ```
-
-#![cfg(all(feature = "movement", feature = "server"))]
+//!
+//! Plain `cargo test` skips this target (see `required-features` in the crate `Cargo.toml`).
+//! Use at least `--features movement,server` to run these tests.
 
 use std::sync::Arc;
 
@@ -349,6 +350,31 @@ async fn test_voucher_amount_exceeds_deposit_rejected() {
 }
 
 #[tokio::test]
+async fn test_voucher_stale_lower_cumulative_rejected() {
+    let key = test_signing_key();
+    let channel_id = test_channel_id_hex();
+    let store = Arc::new(populated_store(&channel_id, 100_000));
+    let method = make_session_method(store.clone());
+
+    let cred_high = make_voucher_credential(&channel_id, 3000, &key);
+    let request: mpp::protocol::intents::SessionRequest =
+        cred_high.challenge.request.decode().unwrap();
+
+    use mpp::protocol::traits::SessionMethod as _;
+    method.verify_session(&cred_high, &request).await.unwrap();
+
+    // Valid signature for an older cumulative — must not succeed (receipt farming).
+    let cred_stale = make_voucher_credential(&channel_id, 1000, &key);
+    let result = method.verify_session(&cred_stale, &request).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(mpp::protocol::traits::ErrorCode::AmountNotIncreasing)
+    );
+}
+
+#[tokio::test]
 async fn test_voucher_replay_idempotent() {
     let key = test_signing_key();
     let channel_id = test_channel_id_hex();
@@ -450,7 +476,6 @@ async fn test_voucher_on_finalized_channel_rejected() {
 
 #[tokio::test]
 async fn test_voucher_wrong_signature_rejected() {
-    let key = test_signing_key();
     let wrong_key = SigningKey::from_bytes(&[0x99; 32]);
     let channel_id = test_channel_id_hex();
     let store = Arc::new(populated_store(&channel_id, 100_000));

@@ -51,6 +51,8 @@ pub enum ErrorCode {
     AmountExceedsDeposit,
     /// Voucher delta is below the minimum threshold.
     DeltaTooSmall,
+    /// Voucher cumulative amount is below the highest amount already accepted (stale voucher).
+    AmountNotIncreasing,
 }
 
 impl ErrorCode {
@@ -73,6 +75,7 @@ impl ErrorCode {
             Self::InvalidSignature => "invalid-signature",
             Self::AmountExceedsDeposit => "amount-exceeds-deposit",
             Self::DeltaTooSmall => "delta-too-small",
+            Self::AmountNotIncreasing => "amount-not-increasing",
         }
     }
 
@@ -103,6 +106,7 @@ impl ErrorCode {
             Self::InvalidSignature => "verification-failed",
             Self::AmountExceedsDeposit => "verification-failed",
             Self::DeltaTooSmall => "verification-failed",
+            Self::AmountNotIncreasing => "verification-failed",
         }
     }
 }
@@ -231,6 +235,11 @@ impl VerificationError {
     pub fn delta_too_small(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::DeltaTooSmall)
     }
+
+    /// Create an "amount-not-increasing" verification error (stale off-chain voucher).
+    pub fn amount_not_increasing(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::AmountNotIncreasing)
+    }
 }
 
 impl fmt::Display for VerificationError {
@@ -277,6 +286,9 @@ impl From<VerificationError> for MppError {
                 MppError::AmountExceedsDeposit(Some(err.message))
             }
             Some(ErrorCode::DeltaTooSmall) => MppError::DeltaTooSmall(Some(err.message)),
+            Some(ErrorCode::AmountNotIncreasing) => {
+                MppError::AmountNotIncreasing(Some(err.message))
+            }
             Some(ErrorCode::CredentialMismatch)
             | Some(ErrorCode::InvalidAmount)
             | Some(ErrorCode::InvalidRecipient)

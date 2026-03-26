@@ -210,6 +210,28 @@ pub struct OnChainChannel {
     pub finalized: bool,
 }
 
+/// Normalize a Move address for equality comparisons (lowercase, 64 hex digits, no `0x`).
+fn normalize_move_addr(addr: &str) -> String {
+    let hex = addr.strip_prefix("0x").unwrap_or(addr);
+    format!("{:0>64}", hex).to_lowercase()
+}
+
+/// True if local channel state matches on-chain identity for this open.
+fn stored_open_matches_on_chain(
+    stored: &ChannelState,
+    on_chain: &OnChainChannel,
+    module_address: &str,
+    registry_address: &str,
+    authorized_signer: &[u8],
+) -> bool {
+    normalize_move_addr(&stored.payer) == normalize_move_addr(&on_chain.payer)
+        && normalize_move_addr(&stored.payee) == normalize_move_addr(&on_chain.payee)
+        && normalize_move_addr(&stored.token) == normalize_move_addr(&on_chain.token)
+        && stored.authorized_signer_pubkey.as_slice() == authorized_signer
+        && stored.module_address == module_address
+        && stored.registry_address == registry_address
+}
+
 /// On-chain transaction verification result.
 #[derive(Debug, Clone)]
 pub struct OnChainTransaction {
@@ -594,6 +616,43 @@ impl SessionMethod {
             ));
         }
 
+        // Idempotent open (client retry / duplicate delivery). On-chain allows only one open
+        // per channel_id; replays must not reset off-chain accounting.
+        if let Some(existing) = self.store.get_channel(channel_id_str).await? {
+            if !stored_open_matches_on_chain(
+                &existing,
+                &on_chain,
+                module_address,
+                registry_address,
+                &authorized_pubkey,
+            ) {
+                return Err(VerificationError::credential_mismatch(
+                    "channel id already registered with different payer, payee, token, or signer",
+                ));
+            }
+            if existing.finalized {
+                return Err(VerificationError::channel_closed("channel is finalized"));
+            }
+            if on_chain.deposit != existing.deposit {
+                let channel_id_owned = channel_id_str.to_string();
+                let new_dep = on_chain.deposit;
+                self.store
+                    .update_channel(
+                        &channel_id_owned,
+                        Box::new(move |current| {
+                            let mut state = current.ok_or_else(|| {
+                                VerificationError::channel_not_found("channel not found")
+                            })?;
+                            state.deposit = new_dep;
+                            Ok(Some(state))
+                        }),
+                    )
+                    .await?;
+            }
+            mpp_info!(channel_id = %channel_id_str, deposit = on_chain.deposit, "open idempotent replay");
+            return Ok(Receipt::success(METHOD_NAME, tx_hash));
+        }
+
         // Create channel in store.
         let channel_id_key = channel_id_str.clone();
         let channel_id_val = channel_id_str.clone();
@@ -854,44 +913,26 @@ impl SessionMethod {
             )));
         }
 
-        // Idempotent accept for replays of the highest voucher.
-        if cumulative_amount <= channel.highest_voucher_amount {
+        if cumulative_amount < channel.highest_voucher_amount {
+            return Err(VerificationError::amount_not_increasing(format!(
+                "voucher cumulative amount {} is below highest accepted {}; stale vouchers are not valid",
+                cumulative_amount, channel.highest_voucher_amount
+            )));
+        }
+
+        // Idempotent accept only for an exact replay of the current highest voucher.
+        if cumulative_amount == channel.highest_voucher_amount {
             let sig_bytes = Self::parse_hex_bytes(signature_str)?;
-            let is_exact_replay =
-                channel
-                    .highest_voucher_signature
-                    .as_ref()
-                    .is_some_and(|stored| {
-                        stored == &sig_bytes && cumulative_amount == channel.highest_voucher_amount
-                    });
+            let is_exact_replay = channel
+                .highest_voucher_signature
+                .as_ref()
+                .is_some_and(|stored| stored == &sig_bytes);
             if is_exact_replay {
                 return Ok(Receipt::success(METHOD_NAME, &channel.channel_id));
             }
-
-            // Not exact replay — verify signature to prevent forgery.
-            let channel_id_bytes = Self::parse_hex_bytes(channel_id_str)?;
-            let sig_array: [u8; 64] = sig_bytes
-                .try_into()
-                .map_err(|_| VerificationError::invalid_payload("signature must be 64 bytes"))?;
-            let pubkey: [u8; 32] = channel
-                .authorized_signer_pubkey
-                .clone()
-                .try_into()
-                .map_err(|_| VerificationError::invalid_payload("stored pubkey not 32 bytes"))?;
-
-            let is_valid = verify_voucher(
-                &channel_id_bytes,
-                cumulative_amount,
-                &sig_array,
-                &pubkey,
-                &channel.authorized_signer_pubkey,
-            );
-            if !is_valid {
-                return Err(VerificationError::invalid_signature(
-                    "invalid voucher signature",
-                ));
-            }
-            return Ok(Receipt::success(METHOD_NAME, &channel.channel_id));
+            return Err(VerificationError::invalid_signature(
+                "replay the exact last voucher credential or increase cumulative amount",
+            ));
         }
 
         let delta = cumulative_amount - channel.highest_voucher_amount;
@@ -1136,5 +1177,44 @@ mod tests {
         let config = SessionMethodConfig::default();
         assert!(config.module_address.starts_with("0x"));
         assert_eq!(config.min_voucher_delta, 0);
+    }
+
+    #[test]
+    fn test_stored_open_matches_on_chain() {
+        let stored = ChannelState {
+            payer: "0x".to_string() + &"0a".repeat(32),
+            payee: "0x".to_string() + &"0b".repeat(32),
+            token: "0xa".to_string(),
+            authorized_signer_pubkey: vec![1u8; 32],
+            module_address: "0xmod".to_string(),
+            registry_address: "0xmod".to_string(),
+            ..test_channel_state("0xabc")
+        };
+        let on_chain = OnChainChannel {
+            payer: stored.payer.clone(),
+            payee: stored.payee.clone(),
+            token: "0xA".to_string(),
+            deposit: 100,
+            settled: 0,
+            close_requested_at: 0,
+            finalized: false,
+        };
+        assert!(stored_open_matches_on_chain(
+            &stored,
+            &on_chain,
+            "0xmod",
+            "0xmod",
+            &[1u8; 32],
+        ));
+        assert!(
+            !stored_open_matches_on_chain(
+                &stored,
+                &on_chain,
+                "0xother",
+                "0xmod",
+                &[1u8; 32],
+            ),
+            "module mismatch should fail"
+        );
     }
 }

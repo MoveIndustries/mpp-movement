@@ -80,3 +80,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 axum = { version = "0.8" }
 reqwest = { version = "0.12", features = ["json"] }
 hex = "0.4"
+
+# Only build when Movement + server session code is enabled (avoids an empty 0-test binary on `cargo test`).
+[[test]]
+name = "integration_movement"
+required-features = ["movement", "server"]
